@@ -146,7 +146,39 @@ def _decode_data_url(data_url: str) -> tuple[str, bytes]:
     match = DATA_URL_RE.match(data_url)
     if not match:
         raise HTTPException(status_code=400, detail="Invalid data URL")
-    return match.group("mime"), base64.b64decode(match.group("data"))
+    return match.group("mime"), _decode_inline_base64_data(match.group("data"))
+
+
+def _decode_inline_base64_data(data: str) -> bytes:
+    """Decode base64 payload from Gemini inlineData/data URL safely.
+
+    Google SDK may serialize bytes with URL-safe alphabet (`-` and `_`).
+    Accept both standard and URL-safe base64, and tolerate missing padding.
+    """
+    if not isinstance(data, str):
+        raise HTTPException(status_code=400, detail="inlineData.data must be a base64 string")
+
+    normalized = re.sub(r"\s+", "", data)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="inlineData.data cannot be empty")
+
+    if normalized.startswith("data:"):
+        data_url_match = DATA_URL_RE.match(normalized)
+        if not data_url_match:
+            raise HTTPException(status_code=400, detail="Invalid data URL")
+        normalized = data_url_match.group("data")
+
+    padding = (-len(normalized)) % 4
+    if padding:
+        normalized += "=" * padding
+
+    try:
+        return base64.b64decode(normalized, validate=True)
+    except Exception:
+        try:
+            return base64.urlsafe_b64decode(normalized)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid inlineData base64: {exc}") from exc
 
 
 def _detect_image_mime_type(image_bytes: bytes, fallback: str = "image/png") -> str:
@@ -373,7 +405,7 @@ async def _extract_prompt_and_images_from_gemini_contents(
                     status_code=400,
                     detail=f"Unsupported inlineData mime type: {part.inlineData.mimeType}",
                 )
-            images.append(base64.b64decode(part.inlineData.data))
+            images.append(_decode_inline_base64_data(part.inlineData.data))
         elif part.fileData is not None:
             mime_type = (part.fileData.mimeType or "").lower()
             if mime_type and not mime_type.startswith("image/"):
