@@ -11,6 +11,10 @@ from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+try:
+    import httpx
+except ImportError:
+    httpx = None
 
 from ..core.auth import verify_api_key_flexible
 from ..core.logger import debug_logger
@@ -242,8 +246,39 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
             debug_logger.log_warning(
                 f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
             )
+            if response.status_code >= 400 and response.text:
+                excerpt = response.text.replace("\n", " ").strip()[:240]
+                debug_logger.log_warning(f"[CONTEXT] 图片下载失败响应: {excerpt}")
     except Exception as exc:
         debug_logger.log_error(f"[CONTEXT] 图片下载异常: {str(exc)}")
+
+    # curl_cffi may fail on some signed GCS URLs after query normalization.
+    # Fallback to httpx to preserve query semantics and avoid false SignatureDoesNotMatch.
+    if httpx is not None:
+        try:
+            async with httpx.AsyncClient(
+                proxy=proxy_url,
+                timeout=60,
+                follow_redirects=True,
+                verify=False,
+            ) as client:
+                response = await client.get(
+                    url,
+                    headers={
+                        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Connection": "keep-alive",
+                        "Referer": "https://labs.google/",
+                    },
+                )
+                if response.status_code == 200 and response.content:
+                    return response.content
+                debug_logger.log_warning(
+                    f"[CONTEXT] 图片下载失败(httpx)，状态码: {response.status_code}"
+                )
+        except Exception as exc:
+            debug_logger.log_error(f"[CONTEXT] 图片下载异常(httpx): {str(exc)}")
 
     return None
 
