@@ -733,6 +733,33 @@ def _normalize_finish_reason(reason: Optional[str]) -> Optional[str]:
     return mapping.get(reason, "STOP")
 
 
+def _extract_gemini_stream_text(choice: Dict[str, Any]) -> str:
+    """Extract Gemini-visible text from an OpenAI-style stream delta.
+
+    For Gemini-compatible streaming, suppress internal progress chatter emitted
+    via `reasoning_content` and only expose user-visible `content`.
+    """
+    delta = choice.get("delta", {})
+    content = delta.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+
+    reasoning = delta.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        # Keep fallback only when it clearly contains media payload.
+        stripped = reasoning.strip()
+        if (
+            MARKDOWN_IMAGE_RE.search(stripped)
+            or HTML_VIDEO_RE.search(stripped)
+            or stripped.startswith("data:image")
+            or stripped.startswith("http://")
+            or stripped.startswith("https://")
+        ):
+            return reasoning
+
+    return ""
+
+
 async def _convert_openai_stream_chunk_to_gemini_event(
     payload: Dict[str, Any],
     response_model: str,
@@ -742,8 +769,7 @@ async def _convert_openai_stream_chunk_to_gemini_event(
         return None
 
     choice = choices[0]
-    delta = choice.get("delta", {})
-    text = delta.get("reasoning_content") or delta.get("content") or ""
+    text = _extract_gemini_stream_text(choice)
     finish_reason = _normalize_finish_reason(choice.get("finish_reason"))
 
     candidate: Dict[str, Any] = {"index": choice.get("index", 0)}
