@@ -667,6 +667,8 @@ MODEL_CONFIG = {
 class GenerationHandler:
     """统一生成处理器"""
 
+    USER_FACING_TRANSIENT_ERROR = "System is busy, please try again later."
+
     def __init__(self, flow_client, token_manager, load_balancer, db, concurrency_manager, proxy_manager):
         cache_dir = Path(__file__).resolve().parents[2] / "tmp"
         self.flow_client = flow_client
@@ -713,6 +715,26 @@ class GenerationHandler:
         if len(text) <= max_length:
             return text
         return f"{text[:max_length - 3]}..."
+
+    def _is_captcha_related_error(self, error_message: Any) -> bool:
+        text = str(error_message or "").strip().lower()
+        if not text:
+            return False
+        return any(
+            marker in text
+            for marker in (
+                "failed to obtain recaptcha token",
+                "recaptcha",
+                "remote_browser",
+                "captcha",
+            )
+        )
+
+    def _to_user_facing_error_message(self, error_message: Any, status_code: int = 500) -> str:
+        normalized = self._normalize_error_message(error_message, max_length=1000)
+        if status_code >= 500 and self._is_captcha_related_error(normalized):
+            return self.USER_FACING_TRANSIENT_ERROR
+        return normalized
 
     def _resolve_video_model_key_for_tier(self, model_config: Dict[str, Any], user_tier: str) -> tuple[str, Optional[str]]:
         """根据账号层级调整视频模型 key。"""
@@ -1879,6 +1901,15 @@ class GenerationHandler:
         import json
         import time
 
+        if finish_reason is None and isinstance(content, str):
+            stripped = content.strip()
+            lowered = stripped.lower()
+            looks_like_error_line = any(
+                marker in lowered for marker in ("failed", "error", "失败", "错误", "❌")
+            )
+            if looks_like_error_line and self._is_captcha_related_error(stripped):
+                content = f"❌ {self.USER_FACING_TRANSIENT_ERROR}\n"
+
         chunk = {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion.chunk",
@@ -1945,10 +1976,11 @@ class GenerationHandler:
     def _create_error_response(self, error_message: str, status_code: int = 500) -> str:
         """创建错误响应"""
         import json
+        public_message = self._to_user_facing_error_message(error_message, status_code=status_code)
 
         error = {
             "error": {
-                "message": error_message,
+                "message": public_message,
                 "type": "server_error" if status_code >= 500 else "invalid_request_error",
                 "code": "generation_failed",
                 "status_code": status_code,
