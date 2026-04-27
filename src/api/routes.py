@@ -1,20 +1,19 @@
-"""API routes for OpenAI-compatible and Gemini generateContent endpoints."""
+﻿"""API routes for OpenAI-compatible and Gemini generateContent endpoints."""
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+import asyncio
 import base64
+import binascii
 import json
 import mimetypes
 import re
+import ssl
+import urllib.request
 from urllib.parse import urlparse
 
-from curl_cffi.requests import AsyncSession
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-try:
-    import httpx
-except ImportError:
-    httpx = None
 
 from ..core.auth import verify_api_key_flexible
 from ..core.logger import debug_logger
@@ -150,39 +149,23 @@ def _decode_data_url(data_url: str) -> tuple[str, bytes]:
     match = DATA_URL_RE.match(data_url)
     if not match:
         raise HTTPException(status_code=400, detail="Invalid data URL")
-    return match.group("mime"), _decode_inline_base64_data(match.group("data"))
+    return match.group("mime"), _decode_base64_bytes(match.group("data"))
 
 
-def _decode_inline_base64_data(data: str) -> bytes:
-    """Decode base64 payload from Gemini inlineData/data URL safely.
-
-    Google SDK may serialize bytes with URL-safe alphabet (`-` and `_`).
-    Accept both standard and URL-safe base64, and tolerate missing padding.
-    """
+def _decode_base64_bytes(data: str) -> bytes:
+    """Accept standard and URL-safe base64 payloads."""
     if not isinstance(data, str):
-        raise HTTPException(status_code=400, detail="inlineData.data must be a base64 string")
+        raise HTTPException(status_code=400, detail="Invalid base64 payload")
 
     normalized = re.sub(r"\s+", "", data)
     if not normalized:
-        raise HTTPException(status_code=400, detail="inlineData.data cannot be empty")
+        raise HTTPException(status_code=400, detail="Base64 payload cannot be empty")
 
-    if normalized.startswith("data:"):
-        data_url_match = DATA_URL_RE.match(normalized)
-        if not data_url_match:
-            raise HTTPException(status_code=400, detail="Invalid data URL")
-        normalized = data_url_match.group("data")
-
-    padding = (-len(normalized)) % 4
-    if padding:
-        normalized += "=" * padding
-
+    padded = normalized + "=" * (-len(normalized) % 4)
     try:
-        return base64.b64decode(normalized, validate=True)
-    except Exception:
-        try:
-            return base64.urlsafe_b64decode(normalized)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid inlineData base64: {exc}") from exc
+        return base64.urlsafe_b64decode(padded.encode("ascii"))
+    except (binascii.Error, ValueError, UnicodeEncodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {exc}") from exc
 
 
 def _detect_image_mime_type(image_bytes: bytes, fallback: str = "image/png") -> str:
@@ -202,6 +185,45 @@ def _guess_mime_type(uri: str, fallback: str) -> str:
     return guessed or fallback
 
 
+def _image_download_headers() -> Dict[str, str]:
+    return {
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": "https://labs.google/",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+
+
+async def _download_image_data_with_urllib(
+    url: str, proxy_url: Optional[str] = None
+) -> Optional[bytes]:
+    def _download() -> Optional[bytes]:
+        handlers = [
+            urllib.request.ProxyHandler(
+                {"http": proxy_url, "https": proxy_url} if proxy_url else {}
+            ),
+            urllib.request.HTTPSHandler(context=ssl._create_unverified_context()),
+        ]
+        opener = urllib.request.build_opener(*handlers)
+        request = urllib.request.Request(url, headers=_image_download_headers())
+        with opener.open(request, timeout=60) as response:
+            if getattr(response, "status", None) == 200:
+                data = response.read()
+                return data if data else None
+        return None
+
+    try:
+        return await asyncio.to_thread(_download)
+    except Exception as exc:
+        debug_logger.log_error(f"[CONTEXT] urllib 閸ュ墽澧栨稉瀣祰瀵倸鐖? {str(exc)}")
+        return None
+
+
 async def retrieve_image_data(url: str) -> Optional[bytes]:
     """Read image bytes from local /tmp cache or remote URL."""
     file_cache = getattr(generation_handler, "file_cache", None)
@@ -216,71 +238,16 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
                 if data:
                     return data
     except Exception as exc:
-        debug_logger.log_warning(f"[CONTEXT] 本地缓存读取失败: {str(exc)}")
+        debug_logger.log_warning(f"[CONTEXT] 鏈湴缂撳瓨璇诲彇澶辫触: {str(exc)}")
 
     proxy_url = None
     try:
         if file_cache and hasattr(file_cache, "_resolve_download_proxy"):
             proxy_url = await file_cache._resolve_download_proxy("image")
     except Exception as exc:
-        debug_logger.log_warning(f"[CONTEXT] 图片下载代理解析失败: {str(exc)}")
+        debug_logger.log_warning(f"[CONTEXT] 鍥剧墖涓嬭浇浠ｇ悊瑙ｆ瀽澶辫触: {str(exc)}")
 
-    try:
-        async with AsyncSession() as session:
-            response = await session.get(
-                url,
-                timeout=60,
-                proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
-                headers={
-                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Connection": "keep-alive",
-                    "Referer": "https://labs.google/",
-                },
-                impersonate="chrome120",
-                verify=False,
-            )
-            if response.status_code == 200 and response.content:
-                return response.content
-            debug_logger.log_warning(
-                f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
-            )
-            if response.status_code >= 400 and response.text:
-                excerpt = response.text.replace("\n", " ").strip()[:240]
-                debug_logger.log_warning(f"[CONTEXT] 图片下载失败响应: {excerpt}")
-    except Exception as exc:
-        debug_logger.log_error(f"[CONTEXT] 图片下载异常: {str(exc)}")
-
-    # curl_cffi may fail on some signed GCS URLs after query normalization.
-    # Fallback to httpx to preserve query semantics and avoid false SignatureDoesNotMatch.
-    if httpx is not None:
-        try:
-            async with httpx.AsyncClient(
-                proxy=proxy_url,
-                timeout=60,
-                follow_redirects=True,
-                verify=False,
-            ) as client:
-                response = await client.get(
-                    url,
-                    headers={
-                        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                        "Accept-Encoding": "gzip, deflate, br",
-                        "Connection": "keep-alive",
-                        "Referer": "https://labs.google/",
-                    },
-                )
-                if response.status_code == 200 and response.content:
-                    return response.content
-                debug_logger.log_warning(
-                    f"[CONTEXT] 图片下载失败(httpx)，状态码: {response.status_code}"
-                )
-        except Exception as exc:
-            debug_logger.log_error(f"[CONTEXT] 图片下载异常(httpx): {str(exc)}")
-
-    return None
+    return await _download_image_data_with_urllib(url, proxy_url=proxy_url)
 
 
 async def _load_image_bytes_from_uri(uri: str) -> bytes:
@@ -385,7 +352,7 @@ async def _append_openai_reference_images(
     if not model_config or model_config["type"] != "image" or len(messages) <= 1:
         return images
 
-    debug_logger.log_info(f"[CONTEXT] 开始查找历史参考图，消息数量: {len(messages)}")
+    debug_logger.log_info(f"[CONTEXT] 寮€濮嬫煡鎵惧巻鍙插弬鑰冨浘锛屾秷鎭暟閲? {len(messages)}")
 
     for msg in reversed(messages[:-1]):
         if msg.role == "assistant" and isinstance(msg.content, str):
@@ -401,15 +368,15 @@ async def _append_openai_reference_images(
                     if downloaded_bytes:
                         images.insert(0, downloaded_bytes)
                         debug_logger.log_info(
-                            f"[CONTEXT] ✅ 添加历史参考图: {image_url}"
+                            f"[CONTEXT] 鉁?娣诲姞鍘嗗彶鍙傝€冨浘: {image_url}"
                         )
                         return images
                     debug_logger.log_warning(
-                        f"[CONTEXT] 图片下载失败或为空，尝试下一个: {image_url}"
+                        f"[CONTEXT] 鍥剧墖涓嬭浇澶辫触鎴栦负绌猴紝灏濊瘯涓嬩竴涓? {image_url}"
                     )
                 except Exception as exc:
                     debug_logger.log_error(
-                        f"[CONTEXT] 处理参考图时出错: {str(exc)}"
+                        f"[CONTEXT] 澶勭悊鍙傝€冨浘鏃跺嚭閿? {str(exc)}"
                     )
     return images
 
@@ -440,7 +407,7 @@ async def _extract_prompt_and_images_from_gemini_contents(
                     status_code=400,
                     detail=f"Unsupported inlineData mime type: {part.inlineData.mimeType}",
                 )
-            images.append(_decode_inline_base64_data(part.inlineData.data))
+            images.append(_decode_base64_bytes(part.inlineData.data))
         elif part.fileData is not None:
             mime_type = (part.fileData.mimeType or "").lower()
             if mime_type and not mime_type.startswith("image/"):
@@ -457,12 +424,12 @@ async def _extract_prompt_and_images_from_gemini_contents(
 def _resolve_request_model(model: str, request: Any) -> str:
     resolved_model = resolve_model_name(model=model, request=request, model_config=MODEL_CONFIG)
     if resolved_model != model:
-        debug_logger.log_info(f"[ROUTE] 模型名已转换: {model} → {resolved_model}")
+        debug_logger.log_info(f"[ROUTE] 妯″瀷鍚嶅凡杞崲: {model} 鈫?{resolved_model}")
     return resolved_model
 
 
 def _get_request_base_url(request: Request) -> Optional[str]:
-    """根据实际请求头推导对外可访问的基础地址。"""
+    """Infer the externally reachable base URL from request headers."""
     forwarded_proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
     forwarded_host = (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
     host = (forwarded_host or request.headers.get("host") or "").strip()
@@ -520,7 +487,7 @@ async def _normalize_gemini_request(
     if system_instruction:
         if media_model and _should_ignore_media_system_instruction(system_instruction):
             debug_logger.log_warning(
-                f"[GEMINI] 忽略媒体模型的 systemInstruction: model={resolved_model}, len={len(system_instruction)}"
+                f"[GEMINI] 蹇界暐濯掍綋妯″瀷鐨?systemInstruction: model={resolved_model}, len={len(system_instruction)}"
             )
         else:
             if media_model:
@@ -645,28 +612,23 @@ async def _build_image_parts_from_uri(uri: str) -> List[Dict[str, Any]]:
             return [{"inlineData": {"mimeType": mime_type, "data": match.group("data")}}]
 
     image_bytes = await retrieve_image_data(uri)
-    if image_bytes:
-        mime_type = _detect_image_mime_type(
-            image_bytes,
-            fallback=_guess_mime_type(uri, "image/png"),
+    if not image_bytes:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to download image output for inlineData response: {uri}",
         )
-        return [
-            {
-                "inlineData": {
-                    "mimeType": mime_type,
-                    "data": base64.b64encode(image_bytes).decode("ascii"),
-                }
-            }
-        ]
 
+    mime_type = _detect_image_mime_type(
+        image_bytes,
+        fallback=_guess_mime_type(uri, "image/png"),
+    )
     return [
         {
-            "fileData": {
-                "mimeType": _guess_mime_type(uri, "image/png"),
-                "fileUri": uri,
+            "inlineData": {
+                "mimeType": mime_type,
+                "data": base64.b64encode(image_bytes).decode("ascii"),
             }
-        },
-        {"text": uri},
+        }
     ]
 
 
@@ -733,33 +695,6 @@ def _normalize_finish_reason(reason: Optional[str]) -> Optional[str]:
     return mapping.get(reason, "STOP")
 
 
-def _extract_gemini_stream_text(choice: Dict[str, Any]) -> str:
-    """Extract Gemini-visible text from an OpenAI-style stream delta.
-
-    For Gemini-compatible streaming, suppress internal progress chatter emitted
-    via `reasoning_content` and only expose user-visible `content`.
-    """
-    delta = choice.get("delta", {})
-    content = delta.get("content")
-    if isinstance(content, str) and content.strip():
-        return content
-
-    reasoning = delta.get("reasoning_content")
-    if isinstance(reasoning, str) and reasoning.strip():
-        # Keep fallback only when it clearly contains media payload.
-        stripped = reasoning.strip()
-        if (
-            MARKDOWN_IMAGE_RE.search(stripped)
-            or HTML_VIDEO_RE.search(stripped)
-            or stripped.startswith("data:image")
-            or stripped.startswith("http://")
-            or stripped.startswith("https://")
-        ):
-            return reasoning
-
-    return ""
-
-
 async def _convert_openai_stream_chunk_to_gemini_event(
     payload: Dict[str, Any],
     response_model: str,
@@ -769,7 +704,8 @@ async def _convert_openai_stream_chunk_to_gemini_event(
         return None
 
     choice = choices[0]
-    text = _extract_gemini_stream_text(choice)
+    delta = choice.get("delta", {})
+    text = delta.get("reasoning_content") or delta.get("content") or ""
     finish_reason = _normalize_finish_reason(choice.get("finish_reason"))
 
     candidate: Dict[str, Any] = {"index": choice.get("index", 0)}
@@ -1046,3 +982,4 @@ async def stream_generate_content(
             status_code=500,
             content=_build_gemini_error_payload(500, str(exc)),
         )
+

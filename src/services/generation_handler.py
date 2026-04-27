@@ -667,8 +667,6 @@ MODEL_CONFIG = {
 class GenerationHandler:
     """统一生成处理器"""
 
-    USER_FACING_TRANSIENT_ERROR = "System is busy, please try again later."
-
     def __init__(self, flow_client, token_manager, load_balancer, db, concurrency_manager, proxy_manager):
         cache_dir = Path(__file__).resolve().parents[2] / "tmp"
         self.flow_client = flow_client
@@ -715,26 +713,6 @@ class GenerationHandler:
         if len(text) <= max_length:
             return text
         return f"{text[:max_length - 3]}..."
-
-    def _is_captcha_related_error(self, error_message: Any) -> bool:
-        text = str(error_message or "").strip().lower()
-        if not text:
-            return False
-        return any(
-            marker in text
-            for marker in (
-                "failed to obtain recaptcha token",
-                "recaptcha",
-                "remote_browser",
-                "captcha",
-            )
-        )
-
-    def _to_user_facing_error_message(self, error_message: Any, status_code: int = 500) -> str:
-        normalized = self._normalize_error_message(error_message, max_length=1000)
-        if status_code >= 500 and self._is_captcha_related_error(normalized):
-            return self.USER_FACING_TRANSIENT_ERROR
-        return normalized
 
     def _resolve_video_model_key_for_tier(self, model_config: Dict[str, Any], user_tier: str) -> tuple[str, Optional[str]]:
         """根据账号层级调整视频模型 key。"""
@@ -846,7 +824,7 @@ class GenerationHandler:
         debug_logger.log_info(f"[GENERATION] 开始生成 - 模型: {model}, 类型: {generation_type}, Prompt: {prompt[:50]}...")
 
         # 向用户展示开始信息
-        if stream:
+        if stream and generation_type != "image":
             yield self._create_stream_chunk(
                 f"✨ {'视频' if generation_type == 'video' else '图片'}生成任务已启动\n",
                 role="assistant"
@@ -924,7 +902,7 @@ class GenerationHandler:
         try:
             # 3. 确保AT有效
             debug_logger.log_info(f"[GENERATION] 检查Token AT有效性...")
-            if stream:
+            if stream and generation_type != "image":
                 yield self._create_stream_chunk("初始化生成环境...\n")
 
             await self._update_request_log_progress(
@@ -1176,6 +1154,8 @@ class GenerationHandler:
         if image_trace is not None:
             image_trace["slot_wait_ms"] = 0
 
+        emit_image_stream_progress = False
+
         if images and len(images) > 0:
             await self._update_request_log_progress(request_log_state, token_id=token.id, status_text="uploading_images", progress=28)
         else:
@@ -1186,7 +1166,7 @@ class GenerationHandler:
             upload_started_at = time.time()
             image_inputs = []
             if images and len(images) > 0:
-                if stream:
+                if emit_image_stream_progress:
                     yield self._create_stream_chunk(f"上传 {len(images)} 张参考图片...\n")
 
                 # 支持多图输入
@@ -1201,13 +1181,13 @@ class GenerationHandler:
                         "name": media_id,
                         "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE"
                     })
-                    if stream:
+                    if emit_image_stream_progress:
                         yield self._create_stream_chunk(f"已上传第 {idx + 1}/{len(images)} 张图片\n")
             if image_trace is not None:
                 image_trace["upload_images_ms"] = int((time.time() - upload_started_at) * 1000)
 
             # 调用生成API
-            if stream:
+            if emit_image_stream_progress:
                 if images and len(images) > 0:
                     yield self._create_stream_chunk("参考图片上传完成，正在进行打码验证...\n")
                 else:
@@ -1268,7 +1248,7 @@ class GenerationHandler:
                 upsample_started_at = time.time()
                 resolution_name = "4K" if "4K" in upsample_resolution else "2K"
                 await self._update_request_log_progress(request_log_state, token_id=token.id, status_text=f"upsampling_{resolution_name.lower()}", progress=82)
-                if stream:
+                if emit_image_stream_progress:
                     yield self._create_stream_chunk(f"正在放大图片到 {resolution_name}...\n")
 
                 # 4K/2K 图片重试逻辑 - 使用配置的最大重试次数
@@ -1289,7 +1269,7 @@ class GenerationHandler:
                         if encoded_image:
                             debug_logger.log_info(f"[UPSAMPLE] 图片已放大到 {resolution_name}")
 
-                            if stream:
+                            if emit_image_stream_progress:
                                 yield self._create_stream_chunk(f"✅ 图片已放大到 {resolution_name}\n")
 
                             # 2K/4K 图片统一落盘为真实文件，日志里只保留链接。
@@ -1308,7 +1288,7 @@ class GenerationHandler:
                                     status_text="caching_image",
                                     progress=90,
                                 )
-                                if stream:
+                                if emit_image_stream_progress:
                                     yield self._create_stream_chunk(f"缓存 {resolution_name} 图片中...\n")
                                 cached_filename = await self.file_cache.cache_base64_image(encoded_image, resolution_name)
                                 local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
@@ -1317,7 +1297,6 @@ class GenerationHandler:
                                 response_state["generated_assets"]["upscaled_image"]["url"] = local_url
                                 self._mark_generation_succeeded(generation_result)
                                 if stream:
-                                    yield self._create_stream_chunk(f"✅ {resolution_name} 图片缓存成功\n")
                                     yield self._create_stream_chunk(
                                         f"![Generated Image]({local_url})",
                                         finish_reason="stop"
@@ -1387,12 +1366,12 @@ class GenerationHandler:
                     status_text="caching_image",
                     progress=90,
                 )
-                if stream:
+                if emit_image_stream_progress:
                     yield self._create_stream_chunk("正在缓存 1K 图片文件...\n")
                 try:
                     cached_filename = await self.file_cache.download_and_cache(image_url, "image")
                     local_url = f"{self._get_base_url(response_state)}/tmp/{cached_filename}"
-                    if stream:
+                    if emit_image_stream_progress:
                         yield self._create_stream_chunk("✅ 1K 图片缓存成功,准备返回缓存地址...\n")
                 except Exception as e:
                     debug_logger.log_error(f"Failed to cache 1K image: {str(e)}")
@@ -1400,7 +1379,7 @@ class GenerationHandler:
                     if stream:
                         cache_error = self._normalize_error_message(e, max_length=120)
                         yield self._create_stream_chunk(f"⚠️ 缓存失败: {cache_error}\n正在返回源链接...\n")
-            elif stream:
+            elif emit_image_stream_progress:
                 yield self._create_stream_chunk("缓存已关闭,正在返回官方图片链接...\n")
             if image_trace is not None:
                 image_trace["cache_image_ms"] = int((time.time() - cache_started_at) * 1000)
@@ -1901,15 +1880,6 @@ class GenerationHandler:
         import json
         import time
 
-        if finish_reason is None and isinstance(content, str):
-            stripped = content.strip()
-            lowered = stripped.lower()
-            looks_like_error_line = any(
-                marker in lowered for marker in ("failed", "error", "失败", "错误", "❌")
-            )
-            if looks_like_error_line and self._is_captcha_related_error(stripped):
-                content = f"❌ {self.USER_FACING_TRANSIENT_ERROR}\n"
-
         chunk = {
             "id": f"chatcmpl-{int(time.time())}",
             "object": "chat.completion.chunk",
@@ -1976,11 +1946,10 @@ class GenerationHandler:
     def _create_error_response(self, error_message: str, status_code: int = 500) -> str:
         """创建错误响应"""
         import json
-        public_message = self._to_user_facing_error_message(error_message, status_code=status_code)
 
         error = {
             "error": {
-                "message": public_message,
+                "message": error_message,
                 "type": "server_error" if status_code >= 500 else "invalid_request_error",
                 "code": "generation_failed",
                 "status_code": status_code,
