@@ -1170,7 +1170,7 @@ class Database:
                 """, (today, token_id))
             await db.commit()
 
-    async def increment_error_count(self, token_id: int):
+    async def increment_error_count(self, token_id: int, count_towards_ban_threshold: bool = True):
         """Increment error count with daily reset
 
         Updates two counters:
@@ -1187,26 +1187,46 @@ class Database:
 
             # If date changed, reset today's error count
             if row and row[0] != today:
-                await db.execute("""
-                    UPDATE token_stats
-                    SET error_count = error_count + 1,
-                        consecutive_error_count = consecutive_error_count + 1,
-                        today_error_count = 1,
-                        today_date = ?,
-                        last_error_at = CURRENT_TIMESTAMP
-                    WHERE token_id = ?
-                """, (today, token_id))
+                if count_towards_ban_threshold:
+                    await db.execute("""
+                        UPDATE token_stats
+                        SET error_count = error_count + 1,
+                            consecutive_error_count = consecutive_error_count + 1,
+                            today_error_count = 1,
+                            today_date = ?,
+                            last_error_at = CURRENT_TIMESTAMP
+                        WHERE token_id = ?
+                    """, (today, token_id))
+                else:
+                    await db.execute("""
+                        UPDATE token_stats
+                        SET error_count = error_count + 1,
+                            today_error_count = 1,
+                            today_date = ?,
+                            last_error_at = CURRENT_TIMESTAMP
+                        WHERE token_id = ?
+                    """, (today, token_id))
             else:
                 # Same day, just increment all counters
-                await db.execute("""
-                    UPDATE token_stats
-                    SET error_count = error_count + 1,
-                        consecutive_error_count = consecutive_error_count + 1,
-                        today_error_count = today_error_count + 1,
-                        today_date = ?,
-                        last_error_at = CURRENT_TIMESTAMP
-                    WHERE token_id = ?
-                """, (today, token_id))
+                if count_towards_ban_threshold:
+                    await db.execute("""
+                        UPDATE token_stats
+                        SET error_count = error_count + 1,
+                            consecutive_error_count = consecutive_error_count + 1,
+                            today_error_count = today_error_count + 1,
+                            today_date = ?,
+                            last_error_at = CURRENT_TIMESTAMP
+                        WHERE token_id = ?
+                    """, (today, token_id))
+                else:
+                    await db.execute("""
+                        UPDATE token_stats
+                        SET error_count = error_count + 1,
+                            today_error_count = today_error_count + 1,
+                            today_date = ?,
+                            last_error_at = CURRENT_TIMESTAMP
+                        WHERE token_id = ?
+                    """, (today, token_id))
             await db.commit()
 
     async def reset_error_count(self, token_id: int):

@@ -983,7 +983,7 @@ class GenerationHandler:
                 error_msg = generation_result.get("error_message") or "生成未成功完成"
                 debug_logger.log_warning(f"[GENERATION] 生成未成功，不扣次数: {error_msg}")
                 if token:
-                    await self.token_manager.record_error(token.id)
+                    await self.token_manager.record_error(token.id, error_msg)
                 duration = time.time() - start_time
                 perf_trace["status"] = "failed"
                 perf_trace["total_ms"] = int(duration * 1000)
@@ -1085,7 +1085,7 @@ class GenerationHandler:
             debug_logger.log_error(f"[GENERATION] ❌ {error_msg}")
             if token:
                 # 记录错误（所有错误统一处理，不再特殊处理429）
-                await self.token_manager.record_error(token.id)
+                await self.token_manager.record_error(token.id, error_msg)
 
             # 先将最终失败状态落库，再返回错误响应，避免日志停在 102。
             duration = time.time() - start_time

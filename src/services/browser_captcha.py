@@ -21,6 +21,12 @@ from urllib.parse import urlparse, unquote, parse_qs
 from ..core.logger import debug_logger
 from ..core.config import config
 
+_SUBPROCESS_TEXT_KWARGS = {
+    "text": True,
+    "encoding": "utf-8",
+    "errors": "replace",
+}
+
 
 # ==================== Docker 环境检测 ====================
 def _is_running_in_docker() -> bool:
@@ -68,7 +74,7 @@ def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
     try:
         debug_logger.log_info(f"[BrowserCaptcha] 正在安装 {package}...")
         print(f"[BrowserCaptcha] 正在安装 {package}...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, timeout=300, **_SUBPROCESS_TEXT_KWARGS)
         if result.returncode == 0:
             debug_logger.log_info(f"[BrowserCaptcha] ✅ {package} 安装成功")
             print(f"[BrowserCaptcha] ✅ {package} 安装成功")
@@ -93,7 +99,7 @@ def _run_playwright_install(use_mirror: bool = False) -> bool:
     try:
         debug_logger.log_info("[BrowserCaptcha] 正在安装 chromium 浏览器...")
         print("[BrowserCaptcha] 正在安装 chromium 浏览器...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+        result = subprocess.run(cmd, capture_output=True, timeout=600, env=env, **_SUBPROCESS_TEXT_KWARGS)
         if result.returncode == 0:
             debug_logger.log_info("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
             print("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
@@ -146,9 +152,9 @@ def _ensure_browser_installed() -> bool:
         result = subprocess.run(
             [sys.executable, "-c", detect_script],
             capture_output=True,
-            text=True,
             timeout=60,
             env=env,
+            **_SUBPROCESS_TEXT_KWARGS,
         )
         browser_path = (result.stdout or "").strip().splitlines()
         browser_path = browser_path[-1].strip() if browser_path else ""
@@ -439,8 +445,8 @@ class TokenBrowser:
                 result = subprocess.run(
                     ['tasklist', '/FI', f'PID eq {pid}'],
                     capture_output=True,
-                    text=True,
                     timeout=10,
+                    **_SUBPROCESS_TEXT_KWARGS,
                 )
                 return str(pid) in (result.stdout or '')
             os.kill(pid, 0)
@@ -462,8 +468,8 @@ class TokenBrowser:
                         f'(Get-CimInstance Win32_Process -Filter "ProcessId = {pid}").CommandLine'
                     ],
                     capture_output=True,
-                    text=True,
                     timeout=15,
+                    **_SUBPROCESS_TEXT_KWARGS,
                 )
                 command_line = (result.stdout or '').strip()
             else:
@@ -497,8 +503,8 @@ class TokenBrowser:
                 subprocess.run(
                     ['taskkill', '/PID', str(pid), '/T', '/F'],
                     capture_output=True,
-                    text=True,
                     timeout=15,
+                    **_SUBPROCESS_TEXT_KWARGS,
                 )
             else:
                 os.kill(pid, signal.SIGKILL)

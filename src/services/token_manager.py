@@ -13,6 +13,10 @@ from .proxy_manager import ProxyManager
 class TokenManager:
     """Token lifecycle manager with AT auto-refresh"""
 
+    NON_BANNABLE_ERROR_KEYWORDS = (
+        "recaptcha",
+    )
+
     def __init__(self, db: Database, flow_client: FlowClient):
         self.db = db
         self.flow_client = flow_client
@@ -633,9 +637,28 @@ class TokenManager:
         else:
             await self.db.increment_token_stats(token_id, "image")
 
-    async def record_error(self, token_id: int):
+    @classmethod
+    def should_count_error_towards_ban_threshold(cls, error_message: Optional[str]) -> bool:
+        """Return whether an upstream error should advance the auto-ban threshold."""
+        if not error_message:
+            return True
+
+        error_lower = error_message.lower()
+        return not any(keyword in error_lower for keyword in cls.NON_BANNABLE_ERROR_KEYWORDS)
+
+    async def record_error(self, token_id: int, error_message: Optional[str] = None):
         """Record token error and auto-disable if threshold reached"""
-        await self.db.increment_token_stats(token_id, "error")
+        count_towards_ban_threshold = self.should_count_error_towards_ban_threshold(error_message)
+        await self.db.increment_error_count(
+            token_id,
+            count_towards_ban_threshold=count_towards_ban_threshold,
+        )
+
+        if not count_towards_ban_threshold:
+            debug_logger.log_info(
+                f"[TOKEN_BAN] Token {token_id} error excluded from auto-ban threshold: {error_message}"
+            )
+            return
 
         # Check if should auto-disable token (based on consecutive errors)
         stats = await self.db.get_token_stats(token_id)

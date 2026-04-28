@@ -19,6 +19,12 @@ from typing import Optional, Dict, Any, Iterable
 from ..core.logger import debug_logger
 from ..core.config import config
 
+_SUBPROCESS_TEXT_KWARGS = {
+    "text": True,
+    "encoding": "utf-8",
+    "errors": "replace",
+}
+
 # 复用 browser 模式的浏览器缓存目录约定，避免容器内每次换位置。
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
 
@@ -91,7 +97,7 @@ def _run_pip_install(package: str, use_mirror: bool = False) -> bool:
     try:
         debug_logger.log_info(f"[BrowserCaptcha] 正在安装 {package}...")
         print(f"[BrowserCaptcha] 正在安装 {package}...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, timeout=300, **_SUBPROCESS_TEXT_KWARGS)
         if result.returncode == 0:
             debug_logger.log_info(f"[BrowserCaptcha] ✅ {package} 安装成功")
             print(f"[BrowserCaptcha] ✅ {package} 安装成功")
@@ -146,7 +152,7 @@ def _run_playwright_install(use_mirror: bool = False) -> bool:
     try:
         debug_logger.log_info("[BrowserCaptcha] 正在安装 chromium 浏览器...")
         print("[BrowserCaptcha] 正在安装 chromium 浏览器...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+        result = subprocess.run(cmd, capture_output=True, timeout=600, env=env, **_SUBPROCESS_TEXT_KWARGS)
         if result.returncode == 0:
             debug_logger.log_info("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
             print("[BrowserCaptcha] ✅ chromium 浏览器安装成功")
@@ -198,9 +204,9 @@ def _detect_playwright_browser_path() -> Optional[str]:
         result = subprocess.run(
             [sys.executable, "-c", detect_script],
             capture_output=True,
-            text=True,
             timeout=60,
             env=env,
+            **_SUBPROCESS_TEXT_KWARGS,
         )
         browser_path_lines = (result.stdout or "").strip().splitlines()
         browser_path = browser_path_lines[-1].strip() if browser_path_lines else ""
@@ -1448,8 +1454,8 @@ class BrowserCaptchaService:
                         version_result = subprocess.run(
                             [browser_executable_path, "--version"],
                             capture_output=True,
-                            text=True,
                             timeout=10,
+                            **_SUBPROCESS_TEXT_KWARGS,
                         )
                         version_output = (
                             (version_result.stdout or "").strip()
